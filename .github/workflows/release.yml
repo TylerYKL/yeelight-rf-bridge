@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -33,18 +35,20 @@ jobs:
       - name: Compile
         run: |
           arduino-cli compile --fqbn esp8266:esp8266:d1_mini firmware --output-dir build
+          ls -la build/
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/firmware.ino.d1_mini.bin
+            build/*.bin
           body: "Firmware release ${{ github.ref_name }}"
 
       - name: Update manifest.json
         run: |
           VER=${GITHUB_REF_NAME}
-          echo "{\"version\":\"${VER#v}\",\"url\":\"https://github.com/${{ github.repository }}/releases/download/${VER}/firmware.ino.d1_mini.bin\"}" > manifest.json
+          BIN=$(ls build/*.bin | head -1 | xargs basename)
+          echo "{\"version\":\"${VER#v}\",\"url\":\"https://github.com/${{ github.repository }}/releases/download/${VER}/${BIN}\"}" > manifest.json
           cat manifest.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
