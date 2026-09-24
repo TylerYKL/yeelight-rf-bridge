@@ -308,21 +308,7 @@ String renderIndex() {
   h += "<div class=card>";
   h += "<div style='font-size:13px;color:#888'>Firmware v"; h += FW_VERSION; h += "</div>";
   h += "<div style='margin-top:8px'><a href='/wifi'>WiFi</a> | <a href='/debug'>RF Debug</a> | <a href='/update'>Upload .bin</a></div>";
-  h += "<div style='margin-top:10px'><button onclick='checkUpdate()' style='width:100%'>Check for Update</button>";
-  h += "<div id=upd style='margin-top:8px;font-size:14px'></div></div>";
   h += "</div>";
-  h += "<script>";
-  h += "async function checkUpdate(){";
-  h += "var d=document.getElementById('upd');d.textContent='Checking...';";
-  h += "try{var r=await fetch('/checkupdate');var j=await r.json();";
-  h += "if(j.error){d.innerHTML='Error: '+j.error;return;}";
-  h += "if(j.hasUpdate){var a=document.createElement('a');a.href='/doupdate?url='+encodeURIComponent(j.url);";
-  h += "a.innerHTML='<button style=background:#30d158;width:100%;margin-top:6px>Install v'+j.latest+'</button>';";
-  h += "d.innerHTML='New version available! ';d.appendChild(a);}";
-  h += "else{d.innerHTML='Up to date (v'+j.current+')';}";
-  h += "}catch(e){d.textContent='Network error';}";
-  h += "}";
-  h += "</script>";
   h += "</body></html>";
   return h;
 }
@@ -894,15 +880,18 @@ void setup() {
 // ==================== OTA update check ====================
 void handleCheckUpdate() {
   HTTPClient http;
-  WiFiClientSecure sec;
+  static WiFiClientSecure sec;
   WiFiClient plain;
   bool useSec = String(UPDATE_MANIFEST_URL).startsWith("https");
-  if (useSec) sec.setInsecure();
+  if (useSec) { sec.setInsecure(); sec.setTimeout(10000); }
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   if (useSec) http.begin(sec, UPDATE_MANIFEST_URL);
   else http.begin(plain, UPDATE_MANIFEST_URL);
   int code = http.GET();
+  Serial.printf("checkupdate http=%d\n", code);
   if (code != 200) {
-    server.send(200, "application/json", "{\"error\":\"fetch failed\",\"code\":" + String(code) + "}");
+    server.send(200, "application/json", "{\"error\":\"HTTP " + String(code) + " " + http.errorToString(code) + "\"}");
     http.end();
     return;
   }
