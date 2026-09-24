@@ -48,14 +48,14 @@ jobs:
         run: |
           VER=${GITHUB_REF_NAME}
           BIN=$(ls build/*.bin | head -1 | xargs basename)
-          echo "{\"version\":\"${VER#v}\",\"url\":\"https://github.com/${{ github.repository }}/releases/download/${VER}/${BIN}\"}" > manifest.json
-          cat manifest.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           BRANCH=$(git remote show origin | grep 'HEAD branch' | sed 's/.*: //')
           echo "Default branch: $BRANCH"
           git fetch origin $BRANCH
           git checkout $BRANCH
+          echo "{\"version\":\"${VER#v}\",\"url\":\"https://github.com/${{ github.repository }}/releases/download/${VER}/${BIN}\"}" > manifest.json
+          cat manifest.json
           git add manifest.json
           git commit -m "Update manifest to ${VER}" || echo "nothing to commit"
           git push origin $BRANCH
