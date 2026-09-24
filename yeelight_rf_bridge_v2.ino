@@ -47,8 +47,8 @@ const int RST_SENSE = 13; // D7 -> RST sense (via 20k + 100uF mod)
 const int LED_PIN = 14;  // D5 -> status LED
 
 // Firmware version for OTA check
-const char FW_VERSION[] = "1.0.0";
-const char UPDATE_MANIFEST_URL[] = "https://raw.githubusercontent.com/USER/REPO/main/manifest.json";
+const char FW_VERSION[] = "1.1.0";
+const char UPDATE_MANIFEST_URL[] = "https://raw.githubusercontent.com/TylerYKL/yeelight-rf-bridge/main/manifest.json";
 
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdate;
