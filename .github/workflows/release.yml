@@ -52,6 +52,7 @@ jobs:
           cat manifest.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
           git add manifest.json
           git commit -m "Update manifest to ${VER}" || echo "nothing to commit"
-          git push
+          git push origin main
