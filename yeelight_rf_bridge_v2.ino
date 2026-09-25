@@ -47,7 +47,7 @@ const int RST_SENSE = 13; // D7 -> RST sense (via 20k + 100uF mod)
 const int LED_PIN = 14;  // D5 -> status LED
 
 // Firmware version for OTA check
-const char FW_VERSION[] = "1.1.0";
+const char FW_VERSION[] = "1.2.0";
 const char UPDATE_MANIFEST_URL[] = "https://raw.githubusercontent.com/TylerYKL/yeelight-rf-bridge/main/manifest.json";
 
 ESP8266WebServer server(80);
@@ -83,6 +83,8 @@ const unsigned long SETUP_TIMEOUT_MS = 10UL * 60UL * 1000UL; // 10 min
 int cfgRepeatBtn = 5;
 int cfgRepeatKnob = 20;
 int cfgCaptureMs = 3000;
+int cfgFrameGapUs = 8000;   // gap between frames (us)
+int cfgMinMatchPct = 85;    // min similarity for confirmed capture
 
 void loadConfig() {
   DynamicJsonDocument doc(512);
@@ -90,12 +92,16 @@ void loadConfig() {
   cfgRepeatBtn  = doc["repeatBtn"]  | 5;
   cfgRepeatKnob = doc["repeatKnob"] | 20;
   cfgCaptureMs  = doc["captureMs"]  | 3000;
+  cfgFrameGapUs = doc["frameGapUs"] | 8000;
+  cfgMinMatchPct = doc["minMatchPct"] | 85;
 }
 void saveConfig() {
   DynamicJsonDocument doc(512);
   doc["repeatBtn"]  = cfgRepeatBtn;
   doc["repeatKnob"] = cfgRepeatKnob;
   doc["captureMs"]  = cfgCaptureMs;
+  doc["frameGapUs"] = cfgFrameGapUs;
+  doc["minMatchPct"] = cfgMinMatchPct;
   saveJson("/config.json", doc);
 }
 
@@ -213,8 +219,8 @@ void IRAM_ATTR rfIsr() {
   unsigned long dur = now - rfLastTime;
   rfLastTime = now;
   if (dur < 40) return;
-  if (dur > 8000) {
-    if (rfPulseLen >= 10) {
+  if (dur > (unsigned)cfgFrameGapUs) {
+    if (rfPulseLen >= 20 && rfPulseBuf[0] > 2000 && rfPulseBuf[1] > 1500) {
       int idx = rfRingHead;
       for (int i = 0; i < rfPulseLen; i++) rfRing[idx].pulses[i] = rfPulseBuf[i];
       rfRing[idx].len = rfPulseLen;
@@ -248,6 +254,67 @@ String rfPopFrame(int &outLen) {
   for (int i = 0; i < outLen; i++) { if (i) s += ","; s += tmp[i]; }
   s += "]";
   return s;
+}
+
+
+// --- Frame validation: check preamble pattern ---
+bool frameValid(const uint16_t* p, int n) {
+  if (n < 20) return false;
+  // Yeelight preamble: pulse0 ~3500, pulse1 ~2500
+  // Accept generous range for other remotes
+  if (p[0] < 2000 || p[0] > 5000) return false;
+  if (p[1] < 1500 || p[1] > 4000) return false;
+  return true;
+}
+
+// --- Frame similarity: returns 0-100% ---
+int frameMatchPct(const uint16_t* a, int na, const uint16_t* b, int nb) {
+  int common = (na < nb) ? na : nb;
+  if (common < 10) return 0;
+  int match = 0;
+  for (int i = 0; i < common; i++) {
+    int diff = (a[i] > b[i]) ? a[i]-b[i] : b[i]-a[i];
+    int tol = (a[i] > b[i] ? a[i] : b[i]) / 6; // ~16% tolerance
+    if (diff <= tol) match++;
+  }
+  int score = match * 100 / common;
+  // Penalize length mismatch
+  if (na != nb) score = score * common * 9 / ((na > nb ? na : nb) * 10);
+  return score;
+}
+
+// --- Pop frame as raw uint16 array (no JSON overhead) ---
+int rfPopFrameRaw(uint16_t* out) {
+  noInterrupts();
+  if (rfRingCount == 0) { interrupts(); return 0; }
+  int tail = (rfRingHead - rfRingCount + MAX_FRAMES) % MAX_FRAMES;
+  RfFrame &f = rfRing[tail];
+  int len = f.len;
+  for (int i = 0; i < len; i++) out[i] = f.pulses[i];
+  rfRingCount--;
+  interrupts();
+  return len;
+}
+
+// --- Confirmed capture: wait for 2 consecutive similar frames ---
+int captureConfirmedRaw(uint16_t* out, int timeoutMs) {
+  uint16_t prev[MAX_PULSES];
+  int prevLen = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)timeoutMs) {
+    delay(5);
+    int len = rfPopFrameRaw(out);
+    if (len < 20) continue;
+    if (!frameValid(out, len)) { prevLen = 0; continue; }
+    if (prevLen > 0) {
+      int score = frameMatchPct(prev, prevLen, out, len);
+      Serial.printf("frame compare: %d%%\n", score);
+      if (score >= cfgMinMatchPct) return len; // confirmed
+    }
+    for (int i = 0; i < len; i++) prev[i] = out[i];
+    prevLen = len;
+  }
+  return 0;
 }
 
 String captureFrameTimeout(int timeoutMs) {
@@ -357,7 +424,7 @@ String renderLearn(String pid) {
   h += "<div class=card><form action='/p/" + pid + "/docapture' method=get>";
   h += "<input name=btn placeholder='Button name (e.g. sleep)'>";
   h += "<input name=label placeholder='Label (e.g. Sleep)'>";
-  h += "<button class=big style='width:100%'>Capture (press remote now)</button>";
+  h += "<button class=big style='width:100%'>Capture & Confirm (hold remote, 2 matching frames needed)</button>";
   h += "</form></div></body></html>";
   return h;
 }
@@ -484,21 +551,43 @@ String renderDebug() {
 }
 
 void handleSniff() {
-  int len;
-  String pulses = rfPopFrame(len);
+  static uint16_t rawBuf[MAX_PULSES];
+  int len = rfPopFrameRaw(rawBuf);
   DynamicJsonDocument doc(2048);
   doc["count"] = 0;
   doc["ms"] = 0;
+  doc["valid"] = false;
+  doc["match"] = 0;
+  doc["matchBtn"] = "";
   doc["data"] = "[]";
-  if (len >= 10) {
-    DynamicJsonDocument pdoc(2048);
-    deserializeJson(pdoc, pulses);
-    JsonArray arr = pdoc.as<JsonArray>();
+  if (len >= 20) {
+    bool valid = frameValid(rawBuf, len);
     long total = 0;
-    for (int i = 0; i < arr.size(); i++) total += arr[i].as<long>();
-    doc["count"] = arr.size();
+    for (int i = 0; i < len; i++) total += rawBuf[i];
+    String pulses = "[";
+    for (int i = 0; i < len; i++) { if (i) pulses += ","; pulses += rawBuf[i]; }
+    pulses += "]";
+    doc["count"] = len;
     doc["ms"] = total / 1000;
+    doc["valid"] = valid;
     doc["data"] = pulses;
+    // Find best matching existing button
+    if (valid) {
+      DynamicJsonDocument pdb(12288);
+      loadProducts(pdb);
+      int bestScore = 0; String bestBtn;
+      for (JsonObject prod : pdb.as<JsonArray>()) {
+        for (JsonObject b : prod["buttons"].as<JsonArray>()) {
+          JsonArray bd = b["data"].as<JsonArray>();
+          uint16_t bp[300]; int bn = bd.size();
+          for (int i = 0; i < bn; i++) bp[i] = bd[i];
+          int score = frameMatchPct(rawBuf, len, bp, bn);
+          if (score > bestScore) { bestScore = score; bestBtn = b["label"] | b["name"] | ""; }
+        }
+      }
+      doc["match"] = bestScore;
+      doc["matchBtn"] = bestBtn;
+    }
     ledFlash(80);
   }
   String out;
@@ -568,6 +657,10 @@ String renderConfig() {
   h += "<input name=rptKnob type=number value='" + String(cfgRepeatKnob) + "'>";
   h += "<label style='font-size:13px;color:#888'>Capture timeout (ms)</label>";
   h += "<input name=capMs type=number value='" + String(cfgCaptureMs) + "'>";
+  h += "<label style='font-size:13px;color:#888'>Frame gap threshold (us, default 8000)</label>";
+  h += "<input name=frameGap type=number value='" + String(cfgFrameGapUs) + "'>";
+  h += "<label style='font-size:13px;color:#888'>Min match % for confirmed capture (default 85)</label>";
+  h += "<input name=minMatch type=number value='" + String(cfgMinMatchPct) + "'>";
   h += "<button class=big style='width:100%'>Save</button>";
   h += "</form></div>";
   h += "<div class=card style='color:#888;font-size:13px'>";
@@ -582,9 +675,15 @@ void handleSaveConfig() {
   cfgRepeatBtn  = server.arg("rptBtn").toInt();
   cfgRepeatKnob = server.arg("rptKnob").toInt();
   cfgCaptureMs  = server.arg("capMs").toInt();
+  cfgFrameGapUs = server.arg("frameGap").toInt();
+  cfgMinMatchPct = server.arg("minMatch").toInt();
   if (cfgRepeatBtn < 1) cfgRepeatBtn = 1;
   if (cfgRepeatKnob < 1) cfgRepeatKnob = 1;
   if (cfgCaptureMs < 500) cfgCaptureMs = 500;
+  if (cfgFrameGapUs < 3000) cfgFrameGapUs = 3000;
+  if (cfgFrameGapUs > 20000) cfgFrameGapUs = 20000;
+  if (cfgMinMatchPct < 50) cfgMinMatchPct = 50;
+  if (cfgMinMatchPct > 100) cfgMinMatchPct = 100;
   saveConfig();
   server.send(200, "text/html; charset=utf-8",
     "<meta charset=utf-8><body style='background:#111;color:#fff;padding:20px'>"
@@ -675,7 +774,14 @@ void handleCapture() {
   String btn = server.arg("btn");
   String label = server.arg("label");
   if (btn == "") { server.send(400, "text/plain", "no btn"); return; }
-  String pulses = captureFrame();
+  uint16_t rawPulses[MAX_PULSES];
+  int rawLen = captureConfirmedRaw(rawPulses, cfgCaptureMs);
+  String pulses;
+  if (rawLen > 0) {
+    pulses = "[";
+    for (int i = 0; i < rawLen; i++) { if (i) pulses += ","; pulses += rawPulses[i]; }
+    pulses += "]";
+  }
   if (pulses == "") {
     server.send(200, "text/html; charset=utf-8",
       "<meta charset=utf-8><body style='background:#111;color:#fff;padding:20px'>"
@@ -752,6 +858,8 @@ bool startStation() {
   String ssid, pass;
   if (!loadWifi(ssid, pass)) return false;
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.print("Connecting to "); Serial.print(ssid);
   unsigned long t0 = millis();
@@ -953,8 +1061,6 @@ void beginServer() {
   server.on("/test", handleTest);
   server.on("/config", [](){ server.send(200, "text/html; charset=utf-8", renderConfig()); });
   server.on("/saveconfig", handleSaveConfig);
-  server.on("/checkupdate", handleCheckUpdate);
-  server.on("/doupdate", handleDoUpdate);
   server.onNotFound([]() {
     String u = server.uri();
     if (u.endsWith("/learn")) handleLearn();
